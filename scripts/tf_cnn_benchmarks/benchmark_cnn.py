@@ -1818,10 +1818,12 @@ class BenchmarkCNN(object):
       init_run_options.experimental.collective_graph_key = 6
     else:
       init_run_options = tf.RunOptions()
-    enq_ops = []
-    for q in self._create_done_queues():
-      qop = q.enqueue(1)
-      enq_ops.append(qop)
+    if self.job_name and not (self.single_session or
+                              self.distributed_collective):
+      enq_ops = []
+      for q in self._create_done_queues():
+        qop = q.enqueue(1)
+        enq_ops.append(qop)
     sv = tf.train.Supervisor(
         # For the purpose of Supervisor, all Horovod workers are 'chiefs',
         # since we want session to be initialized symmetrically on all the
@@ -1985,8 +1987,10 @@ class BenchmarkCNN(object):
         # Wait for other workers to reach the end, so this worker doesn't
         # go away underneath them.
         sess.run([graph_info.execution_barrier])
-      for op in enq_ops:
-        sess.run(op)
+      if self.job_name and not (self.single_session or
+                                self.distributed_collective):
+        for op in enq_ops:
+          sess.run(op)
 
     sv.stop()
     if profiler:
