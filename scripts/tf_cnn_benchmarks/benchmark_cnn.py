@@ -27,6 +27,7 @@ import os
 import re
 import threading
 import time
+import json
 
 from absl import flags as absl_flags
 import numpy as np
@@ -212,6 +213,15 @@ flags.DEFINE_boolean('use_chrome_trace_format', True,
                      'If True, the trace_file, if specified, will be in a '
                      'Chrome trace format. If False, then it will be a '
                      'StepStats raw proto.')
+flags.DEFINE_boolean('show_memory', False,
+                     'If True, the memory log will be recorded in trace file.')
+flags.DEFINE_integer('trace_from', 0,
+                     'Number of iterations to start to trace, if the trace_file'
+                     ' is specified.')
+flags.DEFINE_integer('trace_to', 5,
+                     'Number of iterations to stop to trace, if the trace_file'
+                     ' is specified.')
+
 _NUM_STEPS_TO_PROFILE = 10
 _NUM_OPS_TO_PRINT = 20
 flags.DEFINE_string('tfprof_file', None,
@@ -528,6 +538,37 @@ flags.DEFINE_boolean('log_device_placement', False,
 
 platforms_util.define_platform_params()
 
+class TimeLiner:
+    _timeline_dict = None
+
+    def update_timeline(self, chrome_trace):
+        # convert crome trace to python dict
+        chrome_trace_dict = json.loads(chrome_trace)
+        # for first run store full trace
+        if self._timeline_dict is None:
+            self._timeline_dict = chrome_trace_dict
+        # for other - update only time consumption, not definitions
+        else:
+            for event in chrome_trace_dict['traceEvents']:
+                # events time consumption started with 'ts' prefix
+                if 'ts' in event:
+                    self._timeline_dict['traceEvents'].append(event)
+
+    def save(self, f_name):
+        with open(f_name, 'w') as f:
+            json.dump(self._timeline_dict, f)
+
+def print_parameter_info():
+
+    parameter_count = 0
+    print("="*64)
+    for var in tf.trainable_variables():
+        print(var.name, end='\t')
+        print("@%s" % var.device, end='\t')
+        print(var.shape)
+        parameter_count = parameter_count + reduce(lambda x, y: x * y, var.get_shape().as_list())
+    print("Total parameter : %d, i.e., %.0f MB" % (parameter_count, parameter_count/1024/256))
+    print("="*64)
 
 class GlobalStepWatcher(threading.Thread):
   """A helper class for global_step.
@@ -599,7 +640,8 @@ def create_config_proto(params):
             make_params_from_flags.
   """
   config = tf.ConfigProto()
-  config.allow_soft_placement = True
+  config.allow_soft_placement = params.allow_soft_placement
+  config.log_device_placement = params.log_device_placement
   if params.num_intra_threads is None:
     if params.device == 'gpu':
       config.intra_op_parallelism_threads = 1
@@ -682,16 +724,20 @@ def benchmark_one_step(sess,
                        summary_op=None,
                        show_images_per_sec=True,
                        benchmark_logger=None,
-                       collective_graph_key=0):
+                       collective_graph_key=0,
+                       many_runs_timeline=None,
+                       trace_from=0,
+                       trace_to=0,
+                       show_memory=True):
   """Advance one step of benchmarking."""
   should_profile = profiler and 0 <= step < _NUM_STEPS_TO_PROFILE
   need_options_and_metadata = (
       should_profile or collective_graph_key > 0 or
-      ((trace_filename or partitioned_graph_file_prefix) and step == -2)
+      ((trace_filename or partitioned_graph_file_prefix))
   )
   if need_options_and_metadata:
     run_options = tf.RunOptions()
-    if (trace_filename and step == -2) or should_profile:
+    if trace_filename or should_profile:
       run_options.trace_level = tf.RunOptions.FULL_TRACE
     if partitioned_graph_file_prefix and step == -2:
       run_options.output_partition_graphs = True
@@ -741,7 +787,23 @@ def benchmark_one_step(sess,
   if need_options_and_metadata:
     if should_profile:
       profiler.add_step(step, run_metadata)
-    if trace_filename and step == -2:
+    if trace_filename:
+      trace_dir = os.path.dirname(trace_filename)
+      if not gfile.Exists(trace_dir):
+        gfile.MakeDirs(trace_dir)
+      if params.use_chrome_trace_format:
+        if step >= trace_from and step <= trace_to:
+          if step == trace_to:
+            log_fn('Dumping trace to %s' % trace_filename)
+            many_runs_timeline.save(trace_filename)
+          else:
+            trace = timeline.Timeline(run_metadata.step_stats)
+            many_runs_timeline.update_timeline(
+                          trace.generate_chrome_trace_format(show_memory=show_memory))
+      elif step == -2:
+        log_fn('Dumping trace to %s' % trace_filename)
+        trace_file.write(str(run_metadata.step_stats))
+    '''if trace_filename and step == -2:
       log_fn('Dumping trace to %s' % trace_filename)
       trace_dir = os.path.dirname(trace_filename)
       if not gfile.Exists(trace_dir):
@@ -749,9 +811,9 @@ def benchmark_one_step(sess,
       with gfile.Open(trace_filename, 'w') as trace_file:
         if params.use_chrome_trace_format:
           trace = timeline.Timeline(step_stats=run_metadata.step_stats)
-          trace_file.write(trace.generate_chrome_trace_format(show_memory=True))
+          trace_file.write(trace.generate_chrome_trace_format(show_memory=self.show_memory))
         else:
-          trace_file.write(str(run_metadata.step_stats))
+          trace_file.write(str(run_metadata.step_stats))'''
     if partitioned_graph_file_prefix and step == -2:
       path, filename = os.path.split(partitioned_graph_file_prefix)
       if '.' in filename:
@@ -1111,6 +1173,10 @@ class BenchmarkCNN(object):
                                                         self.dataset)
     self.trace_filename = self.params.trace_file
     self.data_format = self.params.data_format
+    self.show_memory = self.params.show_memory
+    self.trace_from = self.params.trace_from
+    self.trace_to = self.params.trace_to
+    self.many_runs_timeline = TimeLiner()
     self.rewriter_config = self.params.rewriter_config
     autotune_threshold = self.params.autotune_threshold if (
         self.params.autotune_threshold) else 1
@@ -1652,6 +1718,7 @@ class BenchmarkCNN(object):
     graph = tf.Graph()
     with graph.as_default():
       build_result = self._build_graph()
+      print_parameter_info()
     if self.forward_only_and_freeze:
       (graph, result_to_benchmark) = self._freeze_graph(graph, build_result)
     else:
@@ -1942,7 +2009,11 @@ class BenchmarkCNN(object):
             self.trace_filename, self.params.partitioned_graph_file_prefix,
             profiler, image_producer, self.params, fetch_summary,
             benchmark_logger=self.benchmark_logger,
-            collective_graph_key=collective_graph_key)
+            collective_graph_key=collective_graph_key,
+            many_runs_timeline=self.many_runs_timeline,
+            trace_from=self.trace_from,
+            trace_to=self.trace_to,
+            show_memory=self.show_memory)
         if summary_str is not None and is_chief:
           sv.summary_computed(sess, summary_str)
         local_step += 1
